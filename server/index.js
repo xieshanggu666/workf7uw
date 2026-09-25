@@ -33,13 +33,22 @@ function analyze(text) {
   return { sentiment: score < -0.2 ? 'negative' : score > 0.2 ? 'positive' : 'neutral', score }
 }
 
-// ===== 总览 =====
-app.get('/api/state', (req, res) => {
-  const posts = q('SELECT * FROM posts')
+// 总览统计（单条/批量录入后统一刷新）
+function statsSummary(posts = q('SELECT * FROM posts')) {
   const total = posts.length
   const pos = posts.filter((p) => p.sentiment === 'positive').length
   const neg = posts.filter((p) => p.sentiment === 'negative').length
-  const neu = total - pos - neg
+  return {
+    total, pos, neg, neu: total - pos - neg,
+    negRate: total ? Math.round((neg / total) * 100) : 0,
+    hot: posts.filter((p) => p.hot).length,
+    topHeat: Math.max(...posts.map((p) => p.heat), 0)
+  }
+}
+
+// ===== 总览 =====
+app.get('/api/state', (req, res) => {
+  const posts = q('SELECT * FROM posts')
   const hot = q('SELECT * FROM hot_words ORDER BY weight DESC LIMIT 12')
   const activeAlerts = q('SELECT * FROM alerts WHERE active=1')
   const crises = crisisList()
@@ -56,7 +65,7 @@ app.get('/api/state', (req, res) => {
   }
   res.json({
     sources, hotWords: hot, activeAlerts, crises,
-    stats: { total, pos, neg, neu, negRate: total ? Math.round((neg / total) * 100) : 0, hot: posts.filter((p) => p.hot).length, topHeat: Math.max(...posts.map((p) => p.heat), 0) },
+    stats: statsSummary(posts),
     trend
   })
 })
@@ -77,20 +86,73 @@ app.get('/api/topics', (req, res) => {
   res.json(db.prepare('SELECT DISTINCT topic FROM posts').all().map((r) => r.topic))
 })
 
-// 新增舆情（录入后自动触发预警检查）
-app.post('/api/posts', (req, res) => {
-  const { title, content, source_id, topic, media } = req.body
-  const text = (title || '') + ' ' + (content || '')
+// 录入校验：标题/正文必填（批量导入时按条定位错误）
+function validateItem(it, idx) {
+  const errs = []
+  if (!it || typeof it !== 'object') errs.push('格式错误')
+  else {
+    if (typeof it.title !== 'string' || !it.title.trim()) errs.push('缺少标题')
+    if (typeof it.content !== 'string' || !it.content.trim()) errs.push('缺少正文')
+  }
+  return errs.length ? `第${idx + 1}条：${errs.join('、')}` : null
+}
+
+// 统一录入管线：逐条情感分析 → 落库 → 预警检查（红/橙级自动建档危机或去重并入）
+function ingestPost(item) {
+  const title = (item.title || '').trim()
+  const content = (item.content || '').trim()
+  const text = title + ' ' + content
   const a = analyze(text)
   // 热度与负面关键词命中数挂钩，便于稳定演示预警触发
   const negHits = NEG.filter((w) => text.includes(w)).length
   const heat = Math.min(100, 35 + negHits * 12 + Math.round(Math.random() * 12) + (a.sentiment === 'negative' ? 8 : 0))
   const r = run('INSERT INTO posts (title,content,source_id,sentiment,sentiment_score,heat,hot,topic,media,published,created) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
-    title, content, source_id || 1, a.sentiment, a.score, heat,
-    a.sentiment === 'negative' ? 1 : 0, topic || '新增', media || '', now(), now())
+    title, content, item.source_id || 1, a.sentiment, a.score, heat,
+    a.sentiment === 'negative' ? 1 : 0, (item.topic || '').trim() || '新增', (item.media || '').trim(), now(), now())
   const id = Number(r.lastInsertRowid)
   const triggered = checkAlerts(id)
-  res.json({ ok: true, id, sentiment: a.sentiment, heat, triggered })
+  return { id, title, sentiment: a.sentiment, score: a.score, heat, triggered }
+}
+
+// 新增舆情（单条录入，走统一管线，响应结构保持不变）
+app.post('/api/posts', (req, res) => {
+  const err = validateItem(req.body, 0)
+  if (err) return res.status(400).json({ error: err })
+  const r = ingestPost(req.body)
+  res.json({ ok: true, id: r.id, sentiment: r.sentiment, heat: r.heat, triggered: r.triggered })
+})
+
+// 批量导入：整批预校验 → 事务内逐条分析落库（预警/危机闭环与单条一致），任一失败整体回滚
+const BATCH_MAX = 200
+app.post('/api/posts/batch', (req, res) => {
+  const items = req.body && req.body.items
+  if (!Array.isArray(items) || !items.length) return res.status(400).json({ error: 'items 不能为空' })
+  if (items.length > BATCH_MAX) return res.status(400).json({ error: `单次最多导入 ${BATCH_MAX} 条` })
+  // 先整批校验，任一不合格直接拒绝（尚未写库，无需回滚）
+  const errors = items.map((it, i) => validateItem(it, i)).filter(Boolean)
+  if (errors.length) return res.status(400).json({ error: '校验失败，未导入任何数据', details: errors })
+
+  db.exec('BEGIN')
+  let results
+  try {
+    results = items.map((it) => ingestPost(it))
+    db.exec('COMMIT')
+  } catch (e) {
+    try { db.exec('ROLLBACK') } catch { /* 已提交或已回滚 */ }
+    return res.status(500).json({ error: `导入失败，已整体回滚：${e.message}` })
+  }
+  const fired = results.flatMap((r) => r.triggered)
+  res.json({
+    ok: true,
+    imported: results.length,
+    results,
+    summary: {
+      alerts: fired.length,
+      crisesCreated: fired.filter((t) => t.crisisId && !t.deduped).length,
+      crisesMerged: fired.filter((t) => t.deduped).length
+    },
+    stats: statsSummary() // 统计刷新
+  })
 })
 
 function checkAlerts(postId) {
