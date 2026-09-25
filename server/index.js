@@ -13,6 +13,38 @@ const now = () => new Date().toLocaleString('zh-CN')
 const AUTO_LEVELS = ['red', 'orange']
 const LV_TEXT = { red: '红色', orange: '橙色', yellow: '黄色' }
 
+class ApiError extends Error {
+  constructor(message, status = 400) { super(message); this.status = status }
+}
+
+// 统一事务：单条录入与批量导入共用，任一步失败整体回滚
+function withTx(fn) {
+  db.exec('BEGIN')
+  try {
+    const result = fn()
+    db.exec('COMMIT')
+    return result
+  } catch (e) {
+    // 个别底层错误会导致事务自动回滚，忽略此处二次 ROLLBACK 的报错
+    try { db.exec('ROLLBACK') } catch { /* 已无活动事务 */ }
+    throw e
+  }
+}
+
+// 录入项规整与校验（单条/批量共用）。兼容旧单条请求：字段缺省仍按默认值兜底
+function normalizePost(body = {}, idxMsg = '') {
+  const title = (body.title ?? '').toString().trim()
+  const content = (body.content ?? '').toString().trim()
+  if (!title) throw new ApiError(`舆情${idxMsg}标题不能为空`)
+  if (!content) throw new ApiError(`舆情《${title}》${idxMsg}正文不能为空`)
+  let sourceId = Number(body.source_id)
+  if (!Number.isFinite(sourceId) || sourceId <= 0) sourceId = 1
+  if (!q1('SELECT id FROM sources WHERE id=?', sourceId)) throw new ApiError(`舆情《${title}》${idxMsg}渠道不存在`)
+  const topic = (body.topic ?? '').toString().trim() || '新增'
+  const media = (body.media ?? '').toString().trim()
+  return { title, content, source_id: sourceId, topic, media }
+}
+
 // 危机列表（含来源规则、未解除预警数、时间线）
 function crisisList(withTimeline = false) {
   const list = q(`SELECT c.*, a.title alert_title,
@@ -77,23 +109,9 @@ app.get('/api/topics', (req, res) => {
   res.json(db.prepare('SELECT DISTINCT topic FROM posts').all().map((r) => r.topic))
 })
 
-// 新增舆情（录入后自动触发预警检查）
-app.post('/api/posts', (req, res) => {
-  const { title, content, source_id, topic, media } = req.body
-  const text = (title || '') + ' ' + (content || '')
-  const a = analyze(text)
-  // 热度与负面关键词命中数挂钩，便于稳定演示预警触发
-  const negHits = NEG.filter((w) => text.includes(w)).length
-  const heat = Math.min(100, 35 + negHits * 12 + Math.round(Math.random() * 12) + (a.sentiment === 'negative' ? 8 : 0))
-  const r = run('INSERT INTO posts (title,content,source_id,sentiment,sentiment_score,heat,hot,topic,media,published,created) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
-    title, content, source_id || 1, a.sentiment, a.score, heat,
-    a.sentiment === 'negative' ? 1 : 0, topic || '新增', media || '', now(), now())
-  const id = Number(r.lastInsertRowid)
-  const triggered = checkAlerts(id)
-  res.json({ ok: true, id, sentiment: a.sentiment, heat, triggered })
-})
-
-function checkAlerts(postId) {
+// 统一预警触发 → 危机自动建档/并入（事务内调用，不单独开事务）
+// 返回本次命中的预警明细；高等级预警同规则有未结案危机时去重并入，否则自动建档
+function checkAlertsTx(postId) {
   const p = q1('SELECT * FROM posts WHERE id=?', postId)
   const alerts = q('SELECT * FROM alerts WHERE active=1')
   const fired = []
@@ -126,9 +144,94 @@ function checkAlerts(postId) {
     }
     const ev = run('INSERT INTO alert_events (alert_id,post_id,crisis_id,detail,time,status,resolved) VALUES (?,?,?,?,?,?,?)',
       al.id, postId, crisisId, detail, now(), 'open', null)
-    fired.push({ alert: al.title, level: al.level, eventId: Number(ev.lastInsertRowid), crisisId, deduped })
+    fired.push({ alert: al.title, alertId: al.id, level: al.level, eventId: Number(ev.lastInsertRowid), crisisId, deduped })
   }
   return fired
+}
+
+// 统一录入管线（须在事务内调用）：逐条情感分析 → 入库 → 预警触发 → 危机建档/并入
+// 返回该条结果；任一步抛错由外层 withTx 整体回滚
+function ingestOneTx(body, idxMsg = '') {
+  const item = normalizePost(body, idxMsg)
+  const text = item.title + ' ' + item.content
+  const a = analyze(text)
+  // 热度与负面关键词命中数挂钩，便于稳定演示预警触发
+  const negHits = NEG.filter((w) => text.includes(w)).length
+  const heat = Math.min(100, 35 + negHits * 12 + Math.round(Math.random() * 12) + (a.sentiment === 'negative' ? 8 : 0))
+  const r = run('INSERT INTO posts (title,content,source_id,sentiment,sentiment_score,heat,hot,topic,media,published,created) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+    item.title, item.content, item.source_id, a.sentiment, a.score, heat,
+    a.sentiment === 'negative' ? 1 : 0, item.topic, item.media, now(), now())
+  const id = Number(r.lastInsertRowid)
+  const triggered = checkAlertsTx(id)
+  return { id, title: item.title, source_id: item.source_id, topic: item.topic, media: item.media, sentiment: a.sentiment, score: a.score, heat, triggered }
+}
+
+// 新增舆情（单条录入，与批量导入共用统一管线；失败回滚，不产生半截数据）
+app.post('/api/posts', (req, res, next) => {
+  try {
+    const result = withTx(() => ingestOneTx(req.body))
+    res.json({ ok: true, ...result })
+  } catch (e) { next(e) }
+})
+
+// 批量导入：逐条分析、统一预警触发与危机建档/并入
+// mode=all-or-nothing（默认）：任一条失败整体回滚；mode=partial：跳过失败条目，成功部分提交
+app.post('/api/posts/batch', (req, res, next) => {
+  try {
+    let items = req.body?.items
+    if (!Array.isArray(items)) items = Array.isArray(req.body) ? req.body : null
+    if (!items) throw new ApiError('请求体需为舆情数组或 { items: [...] }')
+    if (!items.length) throw new ApiError('导入列表为空')
+    if (items.length > 200) throw new ApiError('单次最多导入 200 条')
+    const partial = req.body?.mode === 'partial'
+
+    // partial 模式：先逐条预校验，合法条目在同一事务内提交，非法条目原样回报
+    if (partial) {
+      const valid = [], invalid = []
+      items.forEach((it, i) => {
+        try { valid.push(normalizePost(it, `第${i + 1}条 `)) }
+        catch (e) { invalid.push({ index: i + 1, title: it?.title || '', error: e.message }) }
+      })
+      if (!valid.length) {
+        return res.json({ ok: false, mode: 'partial', total: items.length, success: 0, failedCount: invalid.length, results: [], failedItems: invalid, triggered: [], crisesCreated: [], crisesMerged: [] })
+      }
+      const results = withTx(() => valid.map((v) => ingestOneTx(v)))
+      return res.json(batchSummary('partial', items.length, results, invalid))
+    }
+
+    // 默认整批事务：失败回滚，已写入的舆情/预警/危机全部撤销
+    try {
+      const results = withTx(() => items.map((it, i) => ingestOneTx(it, `第${i + 1}条 `)))
+      res.json(batchSummary('all-or-nothing', items.length, results, []))
+    } catch (e) {
+      if (e instanceof ApiError) return res.status(422).json({ ok: false, rolledBack: true, error: e.message })
+      throw e
+    }
+  } catch (e) { next(e) }
+})
+
+// 汇总批量结果：成功/失败、触发预警、自动建档/并入的危机去重列表
+function batchSummary(mode, total, results, invalid) {
+  const triggered = [], crisesCreated = [], crisesMergedSet = new Set(), crisesMerged = []
+  for (const r of results) {
+    for (const t of r.triggered) {
+      triggered.push({ postId: r.id, title: r.title, ...t })
+      if (t.crisisId && !t.deduped && !crisesCreated.some((c) => c.crisisId === t.crisisId)) {
+        crisesCreated.push({ crisisId: t.crisisId, alert: t.alert, level: t.level, title: r.title })
+      }
+      if (t.deduped && !crisesMergedSet.has(t.crisisId)) {
+        crisesMergedSet.add(t.crisisId)
+        crisesMerged.push({ crisisId: t.crisisId, alert: t.alert, level: t.level })
+      }
+    }
+  }
+  return {
+    ok: true, mode,
+    total, success: results.length, failedCount: invalid.length,
+    results: results.map(({ triggered, ...rest }) => ({ ...rest, triggeredCount: triggered.length })),
+    failedItems: invalid,
+    triggered, crisesCreated, crisesMerged
+  }
 }
 
 // ===== 热门词 =====
@@ -275,6 +378,13 @@ app.delete('/api/crisis/:id', (req, res) => {
   run('DELETE FROM crisis_timeline WHERE crisis_id=?', req.params.id)
   run('DELETE FROM crisis WHERE id=?', req.params.id)
   res.json({ ok: true })
+})
+
+// 统一错误处理：ApiError 按其状态码返回，其余视为服务器错误（事务已回滚）
+app.use((err, req, res, next) => {
+  const status = err.status || 500
+  if (status === 500) console.error('[PUBMON]', err)
+  res.status(status).json({ ok: false, error: err.message || '服务器错误' })
 })
 
 const PORT = 4130

@@ -34,6 +34,14 @@ export const usePubStore = defineStore('pub', {
             : t.crisisId ? `${t.alert}（已自动建档 #${t.crisisId}）` : t.alert)
         this.msg(`⚠️ 触发预警：${parts.join('、')}`, 'warn')
       } else this.msg('舆情已收录' + (r.sentiment === 'negative' ? '（负面）' : ''), 'success')
+      await this.load()
+      return r
+    },
+    // 批量导入：后端逐条分析并统一预警触发/危机建档；整批事务失败回滚或部分成功
+    async addPostsBatch(payload) {
+      const r = await api('/posts/batch', 'POST', payload)
+      // 统一刷新总览统计（总量/情感占比/热度/危机速览等）
+      await this.load()
       return r
     },
     async fetchAlerts() { return await api('/alerts') },
